@@ -4,6 +4,7 @@ import {
   integer,
   real,
   unique,
+  type AnySQLiteColumn,
 } from "drizzle-orm/sqlite-core";
 
 export enum UserRole {
@@ -264,6 +265,47 @@ export const courseReviews = sqliteTable(
       .$defaultFn(() => new Date().toISOString()),
   },
   (table) => [unique().on(table.userId, table.courseId)]
+);
+
+export const lessonComments = sqliteTable("lesson_comments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  lessonId: integer("lesson_id")
+    .notNull()
+    .references(() => lessons.id),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id),
+  // Nullable self-reference: null = top-level comment, set = a reply.
+  // Single-level threading only — replies always point at a top-level comment.
+  parentId: integer("parent_id").references(
+    (): AnySQLiteColumn => lessonComments.id
+  ),
+  body: text("body").notNull(),
+  // Soft-delete tombstone. When a comment that has replies is deleted, the row
+  // is kept with deletedAt set so the replies stay readable; leaf comments are
+  // hard-deleted instead.
+  deletedAt: text("deleted_at"),
+  createdAt: text("created_at")
+    .notNull()
+    .$defaultFn(() => new Date().toISOString()),
+});
+
+export const lessonBookmarks = sqliteTable(
+  "lesson_bookmarks",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id),
+    lessonId: integer("lesson_id")
+      .notNull()
+      .references(() => lessons.id),
+    createdAt: text("created_at")
+      .notNull()
+      .$defaultFn(() => new Date().toISOString()),
+  },
+  // A user can bookmark a given lesson at most once.
+  (table) => [unique().on(table.userId, table.lessonId)]
 );
 
 export const videoWatchEvents = sqliteTable("video_watch_events", {

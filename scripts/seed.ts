@@ -45,6 +45,7 @@ async function seed() {
 
   // Drop and recreate tables for a clean seed
   sqlite.exec(`
+    DROP TABLE IF EXISTS lesson_comments;
     DROP TABLE IF EXISTS video_watch_events;
     DROP TABLE IF EXISTS quiz_answers;
     DROP TABLE IF EXISTS quiz_attempts;
@@ -1726,6 +1727,91 @@ You've completed the Building REST APIs course. You now have the skills to build
   console.log(
     `Created 1 team with Bossy McBossface as admin, 1 team purchase, and ${seededCoupons.length} coupons (2 redeemed, 3 available).`
   );
+
+  // ─── Lesson Comments ───
+  // Threaded discussion on the first lesson of each course, including one
+  // moderated (tombstoned) comment that still has a reply.
+
+  const tsLesson = course1LessonIds[0]; // "What is TypeScript?"
+  const apiLesson = course2LessonIds[0]; // "What is a REST API?"
+
+  // Emma asks a question; Sarah (course instructor) answers.
+  const [tsQuestion] = db
+    .insert(schema.lessonComments)
+    .values({
+      lessonId: tsLesson,
+      userId: students[0].id,
+      body: "This was a great intro! One question — is TypeScript a replacement for JavaScript, or does it compile down to it?",
+      createdAt: daysAgo(12),
+    })
+    .returning()
+    .all();
+
+  db.insert(schema.lessonComments)
+    .values({
+      lessonId: tsLesson,
+      userId: instructor1.id,
+      body: "Great question! TypeScript compiles down to plain JavaScript — it's a superset, so all your existing JS is already valid TS. The types just disappear at compile time.",
+      parentId: tsQuestion.id,
+      createdAt: daysAgo(11),
+    })
+    .run();
+
+  db.insert(schema.lessonComments)
+    .values({
+      lessonId: tsLesson,
+      userId: students[1].id,
+      body: "Coming from plain JS, the editor autocompletion alone sold me on this.",
+      createdAt: daysAgo(8),
+    })
+    .run();
+
+  // A comment that was moderated away but kept as a tombstone because it has a reply.
+  const [tombstoned] = db
+    .insert(schema.lessonComments)
+    .values({
+      lessonId: tsLesson,
+      userId: students[4].id,
+      body: "[deleted]",
+      deletedAt: daysAgo(5),
+      createdAt: daysAgo(6),
+    })
+    .returning()
+    .all();
+
+  db.insert(schema.lessonComments)
+    .values({
+      lessonId: tsLesson,
+      userId: instructor1.id,
+      body: "No worries — happy to help if you hit any setup issues. Feel free to repost your question any time!",
+      parentId: tombstoned.id,
+      createdAt: daysAgo(5),
+    })
+    .run();
+
+  // Olivia asks on the REST course; Marcus (course instructor) answers.
+  const [apiQuestion] = db
+    .insert(schema.lessonComments)
+    .values({
+      lessonId: apiLesson,
+      userId: students[2].id,
+      body: "Is REST still the go-to in 2026, or should I be learning GraphQL instead?",
+      createdAt: daysAgo(20),
+    })
+    .returning()
+    .all();
+
+  db.insert(schema.lessonComments)
+    .values({
+      lessonId: apiLesson,
+      userId: instructor2.id,
+      body: "Both have their place! REST is still the most common choice for public APIs and is a great foundation. Learn REST first — the GraphQL concepts will click much faster afterwards.",
+      parentId: apiQuestion.id,
+      createdAt: daysAgo(19),
+    })
+    .run();
+
+  console.log("Created lesson comments (with replies and one tombstone).");
 
   console.log("\n✓ Seed complete!");
   console.log("  Users: 9 (1 admin, 2 instructors, 6 students)");
