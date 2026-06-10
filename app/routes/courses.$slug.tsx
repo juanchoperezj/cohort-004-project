@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Link, useSearchParams } from "react-router";
+import { Link, useFetcher, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import type { Route } from "./+types/courses.$slug";
 import {
@@ -8,11 +8,18 @@ import {
   getLessonCountForCourse,
 } from "~/services/courseService";
 import { isUserEnrolled } from "~/services/enrollmentService";
+import { getBookmarkedLessonIds } from "~/services/bookmarkService";
+import {
+  getCourseRatingStats,
+  getUserReview,
+  upsertReview,
+} from "~/services/reviewService";
 import {
   calculateProgress,
   getLessonProgressForCourse,
   getNextIncompleteLesson,
 } from "~/services/progressService";
+import { StarRating, StarRatingInput } from "~/components/star-rating";
 import { getCurrentUserId } from "~/lib/session";
 import { LessonProgressStatus } from "~/db/schema";
 import { Card, CardContent, CardHeader } from "~/components/ui/card";
@@ -27,6 +34,7 @@ import {
 } from "~/components/ui/tabs";
 import {
   AlertTriangle,
+  Bookmark,
   BookOpen,
   CheckCircle2,
   Circle,
@@ -71,12 +79,14 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let progress = 0;
   let lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
+  let bookmarkedLessonIds: number[] = [];
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
 
     if (enrolled) {
       progress = calculateProgress(currentUserId, course.id, false, false);
+      bookmarkedLessonIds = getBookmarkedLessonIds(currentUserId, course.id);
 
       const progressRecords = getLessonProgressForCourse(
         currentUserId,
@@ -102,6 +112,13 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     : courseWithDetails.price;
   const tierInfo = getCountryTierInfo(country);
 
+  const ratingStats = getCourseRatingStats(course.id);
+  const userReview = currentUserId
+    ? getUserReview(currentUserId, course.id)
+    : null;
+  // Any logged-in user may rate a course.
+  const canReview = currentUserId !== null;
+
   return {
     course: courseWithDetails,
     salesCopyHtml,
@@ -110,13 +127,39 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     progress,
     lessonProgressMap,
     nextLessonId,
+    bookmarkedLessonIds,
     currentUserId,
     pppPrice,
     tierInfo,
+    ratingStats,
+    userRating: userReview?.rating ?? null,
+    canReview,
   };
 }
 
-// No action — enrollment is handled via the purchase confirmation page
+export async function action({ params, request }: Route.ActionArgs) {
+  const currentUserId = await getCurrentUserId(request);
+  if (!currentUserId) {
+    throw data("Unauthorized", { status: 401 });
+  }
+
+  const course = getCourseBySlug(params.slug);
+  if (!course) {
+    throw data("Course not found", { status: 404 });
+  }
+
+  const formData = await request.formData();
+  const rating = Number(formData.get("rating"));
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return { ok: false as const, error: "Please choose a rating from 1 to 5." };
+  }
+
+  upsertReview(currentUserId, course.id, rating);
+  return { ok: true as const, rating };
+}
+
+// The action handles course rating submissions; enrollment is handled
+// separately via the purchase confirmation page.
 
 export function HydrateFallback() {
   return (
@@ -178,9 +221,13 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     progress,
     lessonProgressMap,
     nextLessonId,
+    bookmarkedLessonIds,
     currentUserId,
     pppPrice,
     tierInfo,
+    ratingStats,
+    userRating,
+    canReview,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -301,7 +348,19 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
         <p className="mb-4 text-lg text-muted-foreground">
           {course.description}
         </p>
-        <div className="flex items-center gap-4 text-sm text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+          {ratingStats.average !== null && (
+            <span className="flex items-center gap-1.5">
+              <StarRating value={ratingStats.average} size="md" />
+              <span className="font-medium text-foreground">
+                {ratingStats.average.toFixed(1)}
+              </span>
+              <span>
+                ({ratingStats.count}{" "}
+                {ratingStats.count === 1 ? "rating" : "ratings"})
+              </span>
+            </span>
+          )}
           <span className="flex items-center gap-1.5">
             <UserAvatar
               name={course.instructorName}
@@ -355,6 +414,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               enrolled={enrolled}
               isInstructor={isInstructor}
               lessonProgressMap={lessonProgressMap}
+              bookmarkedLessonIds={new Set(bookmarkedLessonIds)}
             />
           </div>
         </div>
@@ -417,6 +477,9 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
               ) : (
                 enrollButton
               )}
+              {canReview && (
+                <RatingWidget currentRating={userRating} />
+              )}
               <div className="space-y-2 pt-2 text-sm text-muted-foreground">
                 <div className="flex items-center gap-2">
                   <BookOpen className="size-4" />
@@ -455,6 +518,7 @@ function CourseContent({
   enrolled,
   isInstructor,
   lessonProgressMap,
+  bookmarkedLessonIds,
 }: {
   course: {
     id: number;
@@ -472,6 +536,7 @@ function CourseContent({
   enrolled: boolean;
   isInstructor: boolean;
   lessonProgressMap: Record<number, string>;
+  bookmarkedLessonIds: Set<number>;
 }) {
   return (
     <div>
@@ -482,16 +547,23 @@ function CourseContent({
         </p>
       ) : (
         <div className="space-y-4">
-          {course.modules.map((mod) => (
+          {course.modules.map((mod) => {
+            const moduleHasBookmark = mod.lessons.some((l) =>
+              bookmarkedLessonIds.has(l.id)
+            );
+            return (
             <Card key={mod.id}>
               <CardHeader>
-                <h3 className="font-semibold">
+                <h3 className="flex items-center gap-2 font-semibold">
                   <Link
                     to={`/courses/${course.slug}/${mod.id}`}
                     className="hover:underline"
                   >
                     {mod.title}
                   </Link>
+                  {moduleHasBookmark && (
+                    <Bookmark className="size-3.5 shrink-0 fill-amber-500 text-amber-500" />
+                  )}
                 </h3>
                 <p className="text-sm text-muted-foreground">
                   {mod.lessons.length} lessons
@@ -557,6 +629,9 @@ function CourseContent({
                                 )}
                               </span>
                             )}
+                            {bookmarkedLessonIds.has(lesson.id) && (
+                              <Bookmark className="size-4 shrink-0 fill-amber-500 text-amber-500" />
+                            )}
                           </Link>
                         ) : (
                           <div className="flex items-center gap-3 px-3 py-2 text-sm">
@@ -581,9 +656,47 @@ function CourseContent({
                 </ul>
               </CardContent>
             </Card>
-          ))}
+            );
+          })}
         </div>
       )}
+    </div>
+  );
+}
+
+function RatingWidget({ currentRating }: { currentRating: number | null }) {
+  const fetcher = useFetcher<{ ok: boolean; rating?: number; error?: string }>();
+  const isSubmitting = fetcher.state !== "idle";
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data) {
+      if (fetcher.data.ok) {
+        toast.success("Thanks! Your rating has been saved.");
+      } else if (fetcher.data.error) {
+        toast.error(fetcher.data.error);
+      }
+    }
+  }, [fetcher.state, fetcher.data]);
+
+  return (
+    <div className="rounded-lg border bg-muted/40 p-4 text-center">
+      <p className="mb-2 text-sm font-medium">
+        {currentRating ? "Your rating" : "Rate this course"}
+      </p>
+      <div className="flex justify-center">
+        <StarRatingInput
+          defaultValue={currentRating ?? 0}
+          disabled={isSubmitting}
+          onChange={(rating) =>
+            fetcher.submit({ rating }, { method: "post" })
+          }
+        />
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">
+        {currentRating
+          ? "Tap a star to update your rating."
+          : "Tap a star to leave your rating."}
+      </p>
     </div>
   );
 }

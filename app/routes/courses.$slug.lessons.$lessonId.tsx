@@ -26,11 +26,26 @@ import {
   getBestAttempt,
 } from "~/services/quizService";
 import { computeResult } from "~/services/quizScoringService";
-import { LessonProgressStatus } from "~/db/schema";
+import { getUserById } from "~/services/userService";
+import {
+  getBookmarkedLessonIds,
+  toggleBookmark,
+} from "~/services/bookmarkService";
+import {
+  getCommentsPage,
+  getCommentCount,
+  getCommentById,
+  addComment,
+  deleteComment,
+} from "~/services/lessonCommentService";
+import { MAX_COMMENT_LENGTH } from "~/lib/comments";
+import { LessonComments } from "~/components/lesson-comments";
+import { LessonProgressStatus, UserRole } from "~/db/schema";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
 import {
   AlertTriangle,
+  Bookmark,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -63,6 +78,13 @@ const lessonParamsSchema = z.object({
 
 const markCompleteSchema = z.object({
   intent: z.literal("mark-complete"),
+});
+
+const COMMENTS_PAGE_SIZE = 20;
+
+const addCommentSchema = z.object({
+  body: z.string().trim().min(1, "Comment cannot be empty").max(MAX_COMMENT_LENGTH),
+  parentId: z.coerce.number().int().positive().optional(),
 });
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
@@ -138,6 +160,8 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let lastWatchPosition = 0;
   let watchProgress = 0;
   let lessonProgressMap: Record<number, string> = {};
+  let bookmarkedLessonIds: number[] = [];
+  let isBookmarked = false;
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
@@ -147,6 +171,10 @@ export async function loader({ params, request }: Route.LoaderArgs) {
       markLessonInProgress(currentUserId, lessonId);
       const progress = getLessonProgress(currentUserId, lessonId);
       lessonStatus = progress?.status ?? null;
+
+      // Bookmarks: current lesson state + all bookmarks in this course (sidebar)
+      bookmarkedLessonIds = getBookmarkedLessonIds(currentUserId, course.id);
+      isBookmarked = bookmarkedLessonIds.includes(lessonId);
 
       // Get progress for all lessons in course (for curriculum sidebar)
       const progressRecords = getLessonProgressForCourse(
@@ -248,6 +276,31 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     }
   }
 
+  // ─── Comments ───
+  // Top-level comments are paginated via a `?comments=N` limit; "Load more"
+  // bumps it. Replies always load with their parent.
+  const url = new URL(request.url);
+  const requestedLimit = Number(url.searchParams.get("comments"));
+  const commentLimit =
+    Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 500)
+      : COMMENTS_PAGE_SIZE;
+
+  const commentsPage = getCommentsPage(lessonId, commentLimit);
+  const commentCount = getCommentCount(lessonId);
+
+  // Posting requires enrollment, being the course instructor, or admin.
+  // Moderating (delete any comment) requires course instructor or admin.
+  let isCourseInstructor = false;
+  let isAdmin = false;
+  if (currentUserId) {
+    isCourseInstructor = course.instructorId === currentUserId;
+    isAdmin = getUserById(currentUserId)?.role === UserRole.Admin;
+  }
+  const canComment =
+    !!currentUserId && (enrolled || isCourseInstructor || isAdmin);
+  const canModerate = isCourseInstructor || isAdmin;
+
   return {
     course: {
       id: courseWithDetails.id,
@@ -281,6 +334,14 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     pppBlocked,
     pppBlockedCountry,
     pppPurchaseCountry,
+    comments: commentsPage.comments,
+    commentsHasMore: commentsPage.hasMore,
+    commentCount,
+    commentLimit,
+    canComment,
+    canModerate,
+    bookmarkedLessonIds,
+    isBookmarked,
   };
 }
 
@@ -303,6 +364,14 @@ export async function action({ params, request }: Route.ActionArgs) {
   if (intent === "mark-complete") {
     markLessonComplete(currentUserId, lessonId);
     return { success: true };
+  }
+
+  if (intent === "toggle-bookmark") {
+    if (!isUserEnrolled(currentUserId, course.id)) {
+      throw data("You must be enrolled to bookmark lessons", { status: 403 });
+    }
+    const { bookmarked } = toggleBookmark(currentUserId, lessonId);
+    return { success: true, bookmarked };
   }
 
   if (intent === "submit-quiz") {
@@ -329,6 +398,57 @@ export async function action({ params, request }: Route.ActionArgs) {
     }
 
     return { quizResult: result };
+  }
+
+  if (intent === "add-comment") {
+    const enrolled = isUserEnrolled(currentUserId, course.id);
+    const isCourseInstructor = course.instructorId === currentUserId;
+    const isAdmin = getUserById(currentUserId)?.role === UserRole.Admin;
+    if (!enrolled && !isCourseInstructor && !isAdmin) {
+      throw data("You must be enrolled to comment", { status: 403 });
+    }
+
+    const parsed = parseFormData(formData, addCommentSchema);
+    if (!parsed.success) {
+      return { commentError: parsed.errors.body ?? "Invalid comment" };
+    }
+
+    try {
+      addComment(
+        currentUserId,
+        lessonId,
+        parsed.data.body,
+        parsed.data.parentId ?? null
+      );
+    } catch (error) {
+      return {
+        commentError:
+          error instanceof Error ? error.message : "Failed to add comment",
+      };
+    }
+    return { commentSuccess: true };
+  }
+
+  if (intent === "delete-comment") {
+    const commentId = Number(formData.get("commentId"));
+    if (!Number.isInteger(commentId)) {
+      throw data("Invalid comment ID", { status: 400 });
+    }
+
+    const comment = getCommentById(commentId);
+    if (!comment || comment.lessonId !== lessonId) {
+      throw data("Comment not found", { status: 404 });
+    }
+
+    const isAuthor = comment.userId === currentUserId;
+    const isCourseInstructor = course.instructorId === currentUserId;
+    const isAdmin = getUserById(currentUserId)?.role === UserRole.Admin;
+    if (!isAuthor && !isCourseInstructor && !isAdmin) {
+      throw data("You cannot delete this comment", { status: 403 });
+    }
+
+    deleteComment(commentId);
+    return { commentSuccess: true };
   }
 
   throw data("Invalid action", { status: 400 });
@@ -382,11 +502,33 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
     pppBlocked,
     pppBlockedCountry,
     pppPurchaseCountry,
+    comments,
+    commentsHasMore,
+    commentCount,
+    commentLimit,
+    canComment,
+    canModerate,
+    bookmarkedLessonIds,
+    isBookmarked,
   } = loaderData;
   const [autoplay, toggleAutoplay] = useAutoplay();
   const fetcher = useFetcher({ key: `mark-complete-${lesson.id}` });
   const quizFetcher = useFetcher({ key: `quiz-${lesson.id}` });
+  const bookmarkFetcher = useFetcher({ key: `bookmark-${lesson.id}` });
   const navigate = useNavigate();
+
+  // Optimistic bookmark state: reflect the in-flight toggle immediately.
+  const bookmarked =
+    bookmarkFetcher.state !== "idle"
+      ? bookmarkFetcher.formData?.get("intent") === "toggle-bookmark"
+        ? !isBookmarked
+        : isBookmarked
+      : (bookmarkFetcher.data?.bookmarked ?? isBookmarked);
+
+  // Sidebar indicators; keep the current lesson in sync with the optimistic toggle.
+  const bookmarkedSet = new Set(bookmarkedLessonIds);
+  if (bookmarked) bookmarkedSet.add(lesson.id);
+  else bookmarkedSet.delete(lesson.id);
 
   const isMarking =
     fetcher.state !== "idle" &&
@@ -454,6 +596,7 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
         currentLessonId={lesson.id}
         lessonProgressMap={lessonProgressMap}
         enrolled={enrolled}
+        bookmarkedLessonIds={bookmarkedSet}
       />
 
       <div className="flex-1 p-6 lg:p-8">
@@ -501,6 +644,27 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
                   Open Code
                 </Button>
               </a>
+            )}
+            {enrolled && currentUserId && (
+              <bookmarkFetcher.Form method="post">
+                <input type="hidden" name="intent" value="toggle-bookmark" />
+                <Button
+                  type="submit"
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={bookmarked}
+                >
+                  <Bookmark
+                    className={cn(
+                      "mr-1.5 size-4",
+                      bookmarked
+                        ? "fill-amber-500 text-amber-500"
+                        : "text-muted-foreground"
+                    )}
+                  />
+                  {bookmarked ? "Bookmarked" : "Bookmark"}
+                </Button>
+              </bookmarkFetcher.Form>
             )}
           </div>
 
@@ -592,6 +756,19 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
             </div>
           )}
 
+          {/* Comments */}
+          <LessonComments
+            courseSlug={course.slug}
+            lessonId={lesson.id}
+            comments={comments}
+            commentCount={commentCount}
+            hasMore={commentsHasMore}
+            commentLimit={commentLimit}
+            currentUserId={currentUserId}
+            canComment={canComment}
+            canModerate={canModerate}
+          />
+
           {/* Prev/Next Navigation */}
           <div className="flex items-center justify-between border-t pt-6">
             {prevLesson ? (
@@ -651,6 +828,7 @@ function CurriculumSidebar({
   currentLessonId,
   lessonProgressMap,
   enrolled,
+  bookmarkedLessonIds,
 }: {
   course: { id: number; title: string; slug: string };
   curriculum: Array<{
@@ -661,6 +839,7 @@ function CurriculumSidebar({
   currentLessonId: number;
   lessonProgressMap: Record<number, string>;
   enrolled: boolean;
+  bookmarkedLessonIds: Set<number>;
 }) {
   // Find which module the current lesson belongs to
   const currentModuleId = curriculum.find((m) =>
@@ -701,6 +880,9 @@ function CurriculumSidebar({
         <nav className="flex-1 p-2">
           {curriculum.map((mod) => {
             const isExpanded = expandedModules.has(mod.id);
+            const moduleHasBookmark = mod.lessons.some((l) =>
+              bookmarkedLessonIds.has(l.id)
+            );
 
             return (
               <div key={mod.id} className="mb-1">
@@ -715,6 +897,9 @@ function CurriculumSidebar({
                     )}
                   />
                   <span className="flex-1 text-left">{mod.title}</span>
+                  {moduleHasBookmark && (
+                    <Bookmark className="size-3.5 shrink-0 fill-amber-500 text-amber-500" />
+                  )}
                 </button>
 
                 {isExpanded && (
@@ -750,6 +935,9 @@ function CurriculumSidebar({
                               <Circle className="size-3.5 shrink-0" />
                             )}
                             <span className="truncate">{l.title}</span>
+                            {bookmarkedLessonIds.has(l.id) && (
+                              <Bookmark className="ml-auto size-3.5 shrink-0 fill-amber-500 text-amber-500" />
+                            )}
                           </Link>
                         </li>
                       );
